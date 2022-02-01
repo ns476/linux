@@ -1221,7 +1221,7 @@ static int arl_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 
        if (qdisc_pkt_len(skb) > q->params.max_size) {
 		if (skb_is_gso(skb) &&
-		    skb_gso_mac_seglen(skb) <= q->params.max_size)
+		    skb_gso_validate_mac_len(skb, q->params.max_size))
                        return gso_segment(skb, sch, to_free);
                return qdisc_drop(skb, sch, to_free);
        }
@@ -1311,7 +1311,7 @@ static const struct nla_policy arl_policy[TCA_ARL_MAX + 1] = {
 	[TCA_ARL_CODEL_TARGET]	= { .type = NLA_U32 },
 };
 
-static int arl_change(struct Qdisc *sch, struct nlattr *opt)
+static int arl_change(struct Qdisc *sch, struct nlattr *opt, struct netlink_ext_ack *extack)
 {
        int err;
        struct arl_sched_data *q = qdisc_priv(sch);
@@ -1320,7 +1320,7 @@ static int arl_change(struct Qdisc *sch, struct nlattr *opt)
        struct psched_ratecfg rate;
        struct tc_ratespec rate_conf;
 
-       err = nla_parse_nested(tb, TCA_ARL_MAX, opt, arl_policy, NULL);
+       err = nla_parse_nested_deprecated(tb, TCA_ARL_MAX, opt, arl_policy, NULL);
        if (err < 0)
                return err;
 
@@ -1375,7 +1375,8 @@ static int arl_change(struct Qdisc *sch, struct nlattr *opt)
                        goto done;
        } else if (q->params.limit > 0) {
                child = fifo_create_dflt(sch, &bfifo_qdisc_ops,
-                                        q->params.limit);
+                                        q->params.limit,
+                                        extack);
                if (IS_ERR(child)) {
                        err = PTR_ERR(child);
                        goto done;
@@ -1389,7 +1390,7 @@ static int arl_change(struct Qdisc *sch, struct nlattr *opt)
        if (child) {
                qdisc_tree_reduce_backlog(q->qdisc, q->qdisc->q.qlen,
                                          q->qdisc->qstats.backlog);
-               qdisc_destroy(q->qdisc);
+               qdisc_put(q->qdisc);
                q->qdisc = child;
        }
 
@@ -1430,7 +1431,7 @@ static u32 arl_get_rtt(struct Qdisc *sch)
                        if (sk->sk_family != AF_INET && sk->sk_family !=
                            AF_INET6)
                                continue;
-			if (inet_sk(sk)->rx_dst_ifindex != arl_dev_index)
+			if (sk->sk_rx_dst_ifindex != arl_dev_index)
                                continue;
                        rtt = arl_get_rtt_from_sk(sk);
                        if (rtt == U32_MAX)
@@ -1444,20 +1445,19 @@ static u32 arl_get_rtt(struct Qdisc *sch)
        return rtt_min;
 }
 
-static void arl_timer_func(unsigned long data)
+static void arl_timer_func(struct timer_list *t)
 {
-       struct Qdisc *sch = (struct Qdisc *)data;
-       struct arl_sched_data *q = qdisc_priv(sch);
+       struct arl_sched_data *q = from_timer(q, t, arl_timer);
        u32 rtt;
 
        mod_timer(&q->arl_timer, jiffies + ARL_TIMER_INTERVAL);
-       rtt = arl_get_rtt(sch);
+       rtt = arl_get_rtt(q->sch);
 
        if (rtt != U32_MAX)
                arl_update_latency(q, rtt);
 }
 
-static int arl_init(struct Qdisc *sch, struct nlattr *opt)
+static int arl_init(struct Qdisc *sch, struct nlattr *opt, struct netlink_ext_ack *extack)
 {
        struct arl_sched_data *q = qdisc_priv(sch);
        struct net_device *dev = qdisc_dev(sch);
@@ -1465,16 +1465,15 @@ static int arl_init(struct Qdisc *sch, struct nlattr *opt)
        arl_params_init(&q->params);
        qdisc_watchdog_init(&q->wtd, sch);
        q->qdisc = &noop_qdisc;
-	q->sch = sch;
+       q->sch = sch;
 
-       init_timer(&q->arl_timer);
+
+       timer_setup(&q->arl_timer, arl_timer_func, 0);
        q->arl_timer.expires = jiffies + ARL_TIMER_INTERVAL;
-       q->arl_timer.data = (unsigned long)sch;
-       q->arl_timer.function = arl_timer_func;
        add_timer(&q->arl_timer);
 
        if (opt) {
-               int err = arl_change(sch, opt);
+               int err = arl_change(sch, opt, extack);
 
                if (err)
                        return err;
@@ -1494,7 +1493,7 @@ static void arl_destroy(struct Qdisc *sch)
 		arl_dev_index = -1;
        qdisc_watchdog_cancel(&q->wtd);
        del_timer_sync(&q->arl_timer);
-       qdisc_destroy(q->qdisc);
+       qdisc_put(q->qdisc);
 }
 
 static int arl_dump(struct Qdisc *sch, struct sk_buff *skb)
@@ -1557,7 +1556,7 @@ static int arl_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
 }
 
 static int arl_graft(struct Qdisc *sch, unsigned long arg, struct Qdisc *new,
-                    struct Qdisc **old)
+                    struct Qdisc **old, struct netlink_ext_ack *extack)
 {
        struct arl_sched_data *q = qdisc_priv(sch);
 
